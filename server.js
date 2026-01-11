@@ -1,59 +1,53 @@
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
+import multer from "multer";
+import pdfParse from "pdf-parse";
 
 const app = express();
-
-// CORS – in produzione puoi limitare al tuo dominio
 app.use(cors());
-
-// Body JSON
 app.use(express.json({ limit: "1mb" }));
 
-// Client OpenAI
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } }); // 15MB
 
-// Modello (impostabile da variabile ambiente)
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-// Prompt di sistema Atto Perfetto
-function buildSystemPrompt() {
+function buildSystemPromptChat() {
   return `
 Sei "Atto Perfetto – Area Dinamica".
 Agisci come Avvocato esperto di diritto italiano.
-Usa un linguaggio tecnico, chiaro, professionale e strutturato.
-
-Obiettivi:
-- Guidare l’utente nella redazione di atti giuridici impeccabili
-- Evidenziare struttura, strategia e coerenza logico-giuridica
-- Suggerire miglioramenti senza inventare fatti
-
-Regole operative:
-- Se mancano informazioni essenziali, chiedile prima di procedere
-- Struttura sempre l’output con titoli e paragrafi
-- Non citare giurisprudenza o norme se non fornite o chiaramente richiedibili
-- Mantieni sempre un tono professionale forense
+Tono tecnico, chiaro, professionale.
+Se mancano informazioni essenziali, chiedile prima di procedere.
+Struttura sempre l’output con titoli e paragrafi.
 `.trim();
 }
 
-// Endpoint CHAT
+function buildSystemPromptActaScan() {
+  return `
+Sei "Atto Perfetto – ACTA SCAN".
+Analizza un atto/ documento giuridico civile italiano in modo professionale e imparziale.
+Produci un report strutturato in:
+1) Punti di forza
+2) Punti deboli e contraddizioni
+3) Istituti giuridici e fattispecie (forti vs deboli)
+4) Considerazioni finali operative
+Non inventare fatti: se un passaggio è ambiguo, segnala l’ambiguità.
+`.trim();
+}
+
+// Chat streaming (SSE)
 app.post("/chat", async (req, res) => {
   try {
     const { message, history } = req.body;
-
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Messaggio non valido" });
-    }
+    if (!message || typeof message !== "string") return res.status(400).json({ error: "Messaggio non valido" });
 
     const messages = [
-      { role: "system", content: buildSystemPrompt() },
+      { role: "system", content: buildSystemPromptChat() },
       ...(Array.isArray(history) ? history.slice(-20) : []),
       { role: "user", content: message }
     ];
 
-    // Headers per streaming
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -67,23 +61,46 @@ app.post("/chat", async (req, res) => {
 
     for await (const chunk of stream) {
       const delta = chunk.choices?.[0]?.delta?.content;
-      if (delta) {
-        res.write(`data: ${JSON.stringify({ delta })}\n\n`);
-      }
+      if (delta) res.write(`data: ${JSON.stringify({ delta })}\n\n`);
     }
-
     res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
     res.end();
-
-  } catch (error) {
-    console.error(error);
-    res.write(`data: ${JSON.stringify({ error: "Errore server" })}\n\n`);
-    res.end();
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Errore server" });
   }
 });
 
-// Avvio server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Atto Perfetto backend attivo sulla porta ${PORT}`);
+// PDF analysis (JSON response)
+app.post("/analyze-pdf", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "File mancante" });
+    if (req.file.mimetype !== "application/pdf") return res.status(400).json({ error: "Formato non supportato (solo PDF)" });
+
+    const pdfText = (await pdfParse(req.file.buffer)).text || "";
+    if (!pdfText.trim()) return res.status(400).json({ error: "Impossibile estrarre testo dal PDF" });
+
+    // Se troppo lungo, tagliamo (poi possiamo fare chunking avanzato)
+    const limited = pdfText.slice(0, 18000);
+
+    const messages = [
+      { role: "system", content: buildSystemPromptActaScan() },
+      { role: "user", content: `Analizza questo documento:\n\n${limited}` }
+    ];
+
+    const out = await client.chat.completions.create({
+      model: MODEL,
+      messages,
+      temperature: 0.2
+    });
+
+    const result = out.choices?.[0]?.message?.content || "Nessuna risposta.";
+    res.json({ result });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Errore server PDF" });
+  }
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Backend live on ${PORT}`));
