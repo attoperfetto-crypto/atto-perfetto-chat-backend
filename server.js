@@ -27,7 +27,7 @@ const MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
 /** =========================
  *  SIMPLE IN-MEMORY STORE (TEST/VALIDATION)
- *  - Per produzione: Postgres consigliato (te lo preparo)
+ *  - Per produzione: Postgres consigliato (persistente)
  *  ========================= */
 const store = {
   conversations: new Map() // userId -> Map(conversationId -> {id,title,updatedAt,messages:[{role,content,createdAt}]})
@@ -80,17 +80,74 @@ function buildOpenAIMessagesFromHistory(conv, systemPrompt) {
 }
 
 /** =========================
- *  PROMPTS
+ *  SYSTEM PROMPTS
  *  ========================= */
+
+/**
+ * ✅ SYSTEM PROMPT “AVVOCATO SENIOR”
+ * Copiato e ottimizzato per output professionale, strategico, senza ripetizioni inutili.
+ */
 function systemChat() {
-  return [
-    `Sei "Atto Perfetto – Area Dinamica".`,
-    `Tono professionale, tecnico e operativo. Non essere generico.`,
-    `Considera TUTTO lo storico della conversazione prima di fare domande.`,
-    `Se informazioni cruciali mancano, fai domande mirate (max 3) e motivate.`,
-    `Produci output strutturati (titoli, elenchi, sezioni).`,
-    `Non inventare norme o giurisprudenza: se non sei certo, segnala incertezza.`,
-  ].join("\n");
+  return `
+Agisci come un Avvocato senior con oltre 20 anni di esperienza nel contenzioso civile italiano.
+Hai una formazione accademica solida, piena padronanza del diritto sostanziale e processuale,
+e una spiccata capacità strategica nella redazione e nell’analisi degli atti giudiziari.
+
+Il tuo compito è assistere l’utente – che è un Avvocato o un professionista del diritto –
+nella costruzione di atti giuridici tecnicamente impeccabili, coerenti, persuasivi
+e funzionali alla strategia processuale.
+
+COMPORTAMENTO GENERALE
+- Mantieni sempre un tono professionale, tecnico, autorevole e operativo.
+- Non semplificare eccessivamente: l’interlocutore è un giurista.
+- Evita qualunque linguaggio divulgativo o da “assistente generico”.
+- Ragiona come se il tuo output dovesse essere letto da un Giudice o da un Collega esperto.
+
+GESTIONE DEL CONTESTO E DELLA MEMORIA
+- Tieni conto dell’intero storico della conversazione.
+- Non ripetere domande o richieste di informazioni già fornite dall’utente.
+- Se un’informazione è già desumibile dai documenti o dalle risposte precedenti,
+  utilizzala senza richiederla nuovamente.
+- Costruisci il ragionamento in modo progressivo e coerente.
+
+ANALISI GIURIDICA
+Quando analizzi un atto o una questione:
+- Individua con precisione i fatti giuridicamente rilevanti.
+- Distingui chiaramente tra fatti, diritto e argomentazioni.
+- Evidenzia i punti di forza e le criticità logico-giuridiche.
+- Segnala eventuali contraddizioni, omissioni o debolezze argomentative.
+- Valuta la tenuta dell’atto in un’ottica processuale concreta.
+
+ISTITUTI GIURIDICI E NORMATIVA
+- Richiama gli istituti giuridici pertinenti solo se rilevanti.
+- Indica articoli del codice e principi giurisprudenziali con prudenza e precisione.
+- Non inventare riferimenti normativi o giurisprudenziali.
+- Se un punto è incerto o opinabile, dichiaralo espressamente.
+
+STRATEGIA PROCESSUALE
+- Ragiona sempre in termini di strategia difensiva o offensiva.
+- Valuta l’efficacia delle argomentazioni in relazione al tipo di procedimento,
+  alla fase processuale e alla posizione della parte (attore/convenuto).
+- Quando opportuno, suggerisci come impostare atti successivi
+  (comparsa, memoria, replica, impugnazione, ecc.).
+
+DOMANDE ALL’UTENTE
+- Formula domande solo se strettamente necessarie.
+- Massimo 3 domande per volta.
+- Ogni domanda deve avere una chiara utilità strategica o tecnica.
+- Se chiedi un dato, rendi evidente (anche implicitamente) perché è rilevante.
+
+OUTPUT
+- Struttura sempre le risposte con titoli, paragrafi e punti elenco.
+- Prediligi chiarezza, ordine e linearità argomentativa.
+- Fornisci output prontamente utilizzabili nella pratica forense.
+- Evita conclusioni vaghe o generiche.
+
+OBIETTIVO FINALE
+Fornire un supporto giuridico di livello professionale elevato,
+come farebbe un Avvocato senior che affianca un Collega nella preparazione di un atto
+o nella definizione della strategia processuale più efficace.
+`.trim();
 }
 
 function systemActaScan() {
@@ -103,6 +160,7 @@ function systemActaScan() {
     `3) Istituti giuridici e fattispecie (forti vs deboli)`,
     `4) Considerazioni finali operative`,
     `Non inventare: se il testo non contiene un dato, dichiaralo.`,
+    `Evita ripetizioni inutili: sii completo ma ordinato.`,
   ].join("\n");
 }
 
@@ -111,6 +169,7 @@ function systemCompare() {
     `Sei "Atto Perfetto – Comparazione Atti".`,
     `Confronti più atti/posizioni: coerenza, conflitti, prevalenza argomentativa.`,
     `Indichi quale impianto appare più robusto e perché.`,
+    `Evidenzi argomentazioni discordanti e punti di rottura.`,
     `Suggerisci strategie operative per gli atti successivi per entrambe le parti.`,
     `Tono tecnico e professionale.`,
   ].join("\n");
@@ -150,7 +209,7 @@ async function analyzeDocWithChunking(docName, text, onProgress) {
           content:
             `Documento: ${docName}\n` +
             `Parte ${i + 1}/${chunks.length}\n\n` +
-            `Analizza SOLO questa parte. Estrarre tesi, punti forti, debolezze/contraddizioni, istituti.\n\n` +
+            `Analizza SOLO questa parte. Estrai tesi, punti forti, debolezze/contraddizioni, istituti.\n\n` +
             chunks[i]
         }
       ]
@@ -223,13 +282,13 @@ app.post("/chat", async (req, res) => {
 
     ensureConversation(userId, conversationId, "Chat Atto Perfetto");
 
-    // Salva msg utente
+    // salva msg utente nello storico
     saveMsg(userId, conversationId, "user", message);
 
     // SSE
     sseHeaders(res);
 
-    // Costruisci history completa (memoria)
+    // costruisci history completa (memoria)
     const conv = getConversation(userId, conversationId);
     const messages = buildOpenAIMessagesFromHistory(conv, systemChat());
 
@@ -250,7 +309,7 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    // Salva risposta assistant nello storico
+    // salva risposta assistant nello storico
     saveMsg(userId, conversationId, "assistant", full);
 
     send({ done: true });
@@ -286,8 +345,11 @@ app.post("/analyze-pdfs-stream", upload.array("files", 5), async (req, res) => {
       return res.end();
     }
 
-    // Salva un messaggio utente “logico” nello storico, così la chat ha contesto
-    saveMsg(userId, conversationId, "user",
+    // salva un messaggio “logico” nello storico (utile per la memoria chat)
+    saveMsg(
+      userId,
+      conversationId,
+      "user",
       `Ho caricato ${files.length} documento/i PDF per l’analisi ACTA SCAN. Procedi con esame e report.`
     );
 
@@ -321,7 +383,12 @@ app.post("/analyze-pdfs-stream", upload.array("files", 5), async (req, res) => {
         continue;
       }
 
-      const rep = await analyzeDocWithChunking(doc.name, doc.text, (p, stage) => send({ progress: p, stage }));
+      const rep = await analyzeDocWithChunking(
+        doc.name,
+        doc.text,
+        (p, stage) => send({ progress: p, stage })
+      );
+
       perDocReports.push(`## REPORT DOCUMENTO: ${doc.name}\n\n${rep}\n`);
     }
 
@@ -350,7 +417,7 @@ app.post("/analyze-pdfs-stream", upload.array("files", 5), async (req, res) => {
       `\n\n` +
       (compareSection || "");
 
-    // Salva report nello storico (così la chat lo ricorda)
+    // salva report nello storico (la chat lo “ricorda”)
     saveMsg(userId, conversationId, "assistant", final);
 
     send({ progress: 100, stage: "Completato ✅ Report salvato.", result: final, done: true });
