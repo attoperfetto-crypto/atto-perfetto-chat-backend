@@ -3,45 +3,39 @@ import cors from "cors";
 import OpenAI from "openai";
 import multer from "multer";
 import pdfParse from "pdf-parse";
-import Database from "better-sqlite3";
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+/** =========================
+ *  CONFIG
+ *  ========================= */
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "X-User-Id"]
+}));
+
+app.use(express.json({ limit: "2mb" }));
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 } // 25MB per file
+});
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-/** ========= DB (SQLite) =========
- * NB: su Render la persistenza file dipende dallo storage.
- * Per salvataggio garantito: usa Render Disk o Postgres (possiamo farlo dopo).
- */
-const db = new Database("atto.db");
-db.pragma("journal_mode = WAL");
+/** =========================
+ *  SIMPLE IN-MEMORY STORE (TEST/VALIDATION)
+ *  - Per produzione: Postgres consigliato (te lo preparo)
+ *  ========================= */
+const store = {
+  conversations: new Map() // userId -> Map(conversationId -> {id,title,updatedAt,messages:[{role,content,createdAt}]})
+};
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS conversations (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  title TEXT,
-  updated_at TEXT NOT NULL
-);
+function nowISO() { return new Date().toISOString(); }
 
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  conversation_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  content TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-`);
-
-const nowISO = () => new Date().toISOString();
-
-function requireUserId(req, res) {
+function getUser(req, res) {
   const userId = req.header("X-User-Id");
   if (!userId) {
     res.status(400).json({ error: "Missing X-User-Id" });
@@ -50,86 +44,118 @@ function requireUserId(req, res) {
   return userId;
 }
 
-function ensureConversation(userId, conversationId, titleIfNew = "Conversazione") {
-  const row = db.prepare("SELECT id FROM conversations WHERE id=? AND user_id=?").get(conversationId, userId);
-  if (!row) {
-    db.prepare("INSERT INTO conversations (id, user_id, title, updated_at) VALUES (?, ?, ?, ?)")
-      .run(conversationId, userId, titleIfNew, nowISO());
+function ensureUserMap(userId) {
+  if (!store.conversations.has(userId)) store.conversations.set(userId, new Map());
+  return store.conversations.get(userId);
+}
+
+function ensureConversation(userId, conversationId, title = "Conversazione") {
+  const m = ensureUserMap(userId);
+  if (!m.has(conversationId)) {
+    m.set(conversationId, { id: conversationId, title, updatedAt: nowISO(), messages: [] });
   } else {
-    db.prepare("UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?").run(nowISO(), conversationId, userId);
+    m.get(conversationId).updatedAt = nowISO();
   }
+  return m.get(conversationId);
 }
 
-function saveMessage(userId, conversationId, role, content) {
-  db.prepare("INSERT INTO messages (conversation_id, user_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)")
-    .run(conversationId, userId, role, content, nowISO());
-  db.prepare("UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?")
-    .run(nowISO(), conversationId, userId);
+function saveMsg(userId, conversationId, role, content) {
+  const c = ensureConversation(userId, conversationId);
+  c.messages.push({ role, content, createdAt: nowISO() });
+  c.updatedAt = nowISO();
 }
 
+function getConversation(userId, conversationId) {
+  const m = store.conversations.get(userId);
+  return m?.get(conversationId) || null;
+}
+
+function buildOpenAIMessagesFromHistory(conv, systemPrompt) {
+  const msgs = [{ role: "system", content: systemPrompt }];
+  for (const m of (conv?.messages || [])) {
+    const role = (m.role === "assistant" || m.role === "user") ? m.role : "user";
+    msgs.push({ role, content: m.content });
+  }
+  return msgs;
+}
+
+/** =========================
+ *  PROMPTS
+ *  ========================= */
 function systemChat() {
-  return `
-Sei "Atto Perfetto – Area Dinamica".
-Agisci come Avvocato esperto di diritto italiano.
-Tono tecnico, chiaro, professionale.
-Se mancano dati essenziali, fai prima domande mirate.
-Struttura sempre l’output con titoli e paragrafi.
-`.trim();
+  return [
+    `Sei "Atto Perfetto – Area Dinamica".`,
+    `Tono professionale, tecnico e operativo. Non essere generico.`,
+    `Considera TUTTO lo storico della conversazione prima di fare domande.`,
+    `Se informazioni cruciali mancano, fai domande mirate (max 3) e motivate.`,
+    `Produci output strutturati (titoli, elenchi, sezioni).`,
+    `Non inventare norme o giurisprudenza: se non sei certo, segnala incertezza.`,
+  ].join("\n");
 }
 
 function systemActaScan() {
-  return `
-Sei "Atto Perfetto – ACTA SCAN (Civile)".
-Analizza atti/ documenti giuridici italiani con rigore tecnico e imparzialità.
-Output SEMPRE strutturato in:
-1) Punti di forza
-2) Punti deboli e contraddizioni
-3) Istituti giuridici e fattispecie (forti vs deboli)
-4) Considerazioni finali operative (strategie e prossimi passi)
-Non inventare fatti o riferimenti.
-`.trim();
+  return [
+    `Sei "Atto Perfetto – ACTA SCAN (Civile)".`,
+    `Analizzi atti giudiziari civili italiani in modo professionale e imparziale.`,
+    `Output OBBLIGATORIO nelle sezioni:`,
+    `1) Punti di forza`,
+    `2) Punti deboli e contraddizioni`,
+    `3) Istituti giuridici e fattispecie (forti vs deboli)`,
+    `4) Considerazioni finali operative`,
+    `Non inventare: se il testo non contiene un dato, dichiaralo.`,
+  ].join("\n");
 }
 
 function systemCompare() {
-  return `
-Sei "Atto Perfetto – Comparazione Atti".
-Confronta due o più atti della stessa controversia.
-- Valuta quale impianto regge meglio e perché
-- Evidenzia contrasti e contraddizioni reciproche
-- Suggerisci prossimi atti per ciascuna parte (contesto civile)
-Tono: forense, tecnico, impeccabile.
-`.trim();
+  return [
+    `Sei "Atto Perfetto – Comparazione Atti".`,
+    `Confronti più atti/posizioni: coerenza, conflitti, prevalenza argomentativa.`,
+    `Indichi quale impianto appare più robusto e perché.`,
+    `Suggerisci strategie operative per gli atti successivi per entrambe le parti.`,
+    `Tono tecnico e professionale.`,
+  ].join("\n");
 }
 
-/** ===== Chunking (caratteri) ===== */
-function chunkText(text, chunkSize = 6500) {
-  const chunks = [];
-  for (let i = 0; i < text.length; i += chunkSize) chunks.push(text.slice(i, i + chunkSize));
-  return chunks;
+/** =========================
+ *  UTILS
+ *  ========================= */
+function sseHeaders(res) {
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
 }
 
-async function analyzeDocumentWithChunking(docName, text, onProgress) {
-  const chunks = chunkText(text, 6500);
+function chunkText(text, maxChars = 9000) {
+  const out = [];
+  for (let i = 0; i < text.length; i += maxChars) out.push(text.slice(i, i + maxChars));
+  return out;
+}
+
+async function analyzeDocWithChunking(docName, text, onProgress) {
+  const chunks = chunkText(text, 9000);
   const partials = [];
 
   for (let i = 0; i < chunks.length; i++) {
-    const progress = Math.round((i / Math.max(1, chunks.length)) * 70) + 10; // 10..80
-    onProgress?.(progress, `Analisi chunk ${i + 1}/${chunks.length} – ${docName}`);
+    const p = 10 + Math.round((i / Math.max(1, chunks.length)) * 70);
+    onProgress?.(p, `Analisi contenuto ${i + 1}/${chunks.length} – ${docName}`);
 
-    const out = await client.chat.completions.create({
+    const r = await client.chat.completions.create({
       model: MODEL,
       temperature: 0.2,
       messages: [
         { role: "system", content: systemActaScan() },
-        { role: "user", content:
-          `Documento: ${docName}\nCHUNK ${i + 1}/${chunks.length}\n\n` +
-          `Analizza SOLO questo chunk ed estrai: tesi/argomenti, punti forti, punti deboli/contraddizioni, istituti richiamati.\n\n` +
-          chunks[i]
+        {
+          role: "user",
+          content:
+            `Documento: ${docName}\n` +
+            `Parte ${i + 1}/${chunks.length}\n\n` +
+            `Analizza SOLO questa parte. Estrarre tesi, punti forti, debolezze/contraddizioni, istituti.\n\n` +
+            chunks[i]
         }
       ]
     });
-
-    partials.push(out.choices?.[0]?.message?.content || "");
+    partials.push(r.choices?.[0]?.message?.content || "");
   }
 
   onProgress?.(85, `Consolidamento report – ${docName}`);
@@ -139,10 +165,12 @@ async function analyzeDocumentWithChunking(docName, text, onProgress) {
     temperature: 0.2,
     messages: [
       { role: "system", content: systemActaScan() },
-      { role: "user", content:
-        `Consolida in UN SOLO REPORT completo l’analisi del documento "${docName}". ` +
-        `Usa esclusivamente le analisi parziali seguenti (una per chunk) e produci un report finale unico, coerente e non ripetitivo.\n\n` +
-        partials.map((p,idx)=>`--- ANALISI CHUNK ${idx+1} ---\n${p}\n`).join("\n")
+      {
+        role: "user",
+        content:
+          `Consolida in UN SOLO REPORT completo per "${docName}".\n` +
+          `Usa SOLO le analisi parziali seguenti:\n\n` +
+          partials.map((p, idx) => `--- PARTE ${idx + 1} ---\n${p}\n`).join("\n")
       }
     ]
   });
@@ -150,137 +178,153 @@ async function analyzeDocumentWithChunking(docName, text, onProgress) {
   return consolidated.choices?.[0]?.message?.content || "Nessun output.";
 }
 
-/** ====== LIST conversations ====== */
+function prettyErrorMessage(e) {
+  const msg = String(e?.message || e);
+  const isQuota = msg.includes("insufficient_quota") || msg.includes("quota");
+  const isRate = msg.includes("Rate limit") || msg.includes("429");
+  if (isQuota) return "Quota API momentaneamente esaurita. Riprova tra poco.";
+  if (isRate) return "Servizio molto richiesto: riprova tra qualche secondo.";
+  return msg;
+}
+
+/** =========================
+ *  ROUTES
+ *  ========================= */
+app.get("/health", (req, res) => res.json({ ok: true, time: nowISO() }));
+
 app.get("/conversations", (req, res) => {
-  const userId = requireUserId(req, res);
-  if (!userId) return;
-
-  const items = db.prepare(
-    "SELECT id, title, updated_at FROM conversations WHERE user_id=? ORDER BY updated_at DESC LIMIT 50"
-  ).all(userId);
-
-  res.json({ items });
+  const userId = getUser(req, res); if (!userId) return;
+  const m = store.conversations.get(userId);
+  const items = m ? Array.from(m.values()).sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || "")) : [];
+  res.json({ items: items.map(x => ({ id: x.id, title: x.title, updated_at: x.updatedAt })) });
 });
 
-/** ====== READ conversation ====== */
 app.get("/conversation/:id", (req, res) => {
-  const userId = requireUserId(req, res);
-  if (!userId) return;
-
-  const id = req.params.id;
-  const conv = db.prepare("SELECT id FROM conversations WHERE id=? AND user_id=?").get(id, userId);
-  if (!conv) return res.status(404).json({ error: "Not found" });
-
-  const messages = db.prepare(
-    "SELECT role, content, created_at FROM messages WHERE conversation_id=? AND user_id=? ORDER BY id ASC"
-  ).all(id, userId);
-
-  res.json({ id, messages });
+  const userId = getUser(req, res); if (!userId) return;
+  const m = store.conversations.get(userId);
+  const c = m?.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Not found" });
+  res.json({ id: c.id, messages: c.messages });
 });
 
-/** ====== CHAT SSE + save ====== */
+/** =========================
+ *  CHAT (SSE) — MEMORIA STORICA COMPLETA
+ *  ========================= */
 app.post("/chat", async (req, res) => {
-  try {
-    const userId = requireUserId(req, res);
-    if (!userId) return;
+  const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
-    const { message, conversationId } = req.body;
-    if (!message || typeof message !== "string") return res.status(400).json({ error: "Messaggio non valido" });
-    if (!conversationId || typeof conversationId !== "string") return res.status(400).json({ error: "Missing conversationId" });
+  try {
+    const userId = getUser(req, res); if (!userId) return;
+
+    const { message, conversationId } = req.body || {};
+    if (!message || !conversationId) {
+      return res.status(400).json({ error: "Missing message/conversationId" });
+    }
 
     ensureConversation(userId, conversationId, "Chat Atto Perfetto");
-    saveMessage(userId, conversationId, "user", message);
 
-    const messages = [
-      { role: "system", content: systemChat() },
-      { role: "user", content: message }
-    ];
+    // Salva msg utente
+    saveMsg(userId, conversationId, "user", message);
 
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
+    // SSE
+    sseHeaders(res);
+
+    // Costruisci history completa (memoria)
+    const conv = getConversation(userId, conversationId);
+    const messages = buildOpenAIMessagesFromHistory(conv, systemChat());
+
+    let full = "";
 
     const stream = await client.chat.completions.create({
       model: MODEL,
-      messages,
       temperature: 0.2,
-      stream: true
+      stream: true,
+      messages
     });
 
-    let full = "";
     for await (const chunk of stream) {
       const delta = chunk.choices?.[0]?.delta?.content;
       if (delta) {
         full += delta;
-        res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+        send({ delta });
       }
     }
 
-    saveMessage(userId, conversationId, "assistant", full);
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    // Salva risposta assistant nello storico
+    saveMsg(userId, conversationId, "assistant", full);
+
+    send({ done: true });
     res.end();
+
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Errore server" });
+    console.error("CHAT ERROR:", e);
+    sseHeaders(res);
+    send({ error: prettyErrorMessage(e), done: true });
+    res.end();
   }
 });
 
-/** ====== MULTIFILE + CHUNKING + PROGRESS (SSE) + SAVE ====== */
+/** =========================
+ *  ANALYZE PDFs (SSE) — MULTIFILE + CHUNKING + REPORT + SALVATAGGIO
+ *  ========================= */
 app.post("/analyze-pdfs-stream", upload.array("files", 5), async (req, res) => {
-  try {
-    const userId = requireUserId(req, res);
-    if (!userId) return;
+  const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
-    const conversationId = req.body.conversationId;
-    if (!conversationId || typeof conversationId !== "string") {
-      return res.status(400).json({ error: "Missing conversationId" });
-    }
+  try {
+    const userId = getUser(req, res); if (!userId) return;
+
+    const conversationId = req.body?.conversationId;
+    if (!conversationId) return res.status(400).json({ error: "Missing conversationId" });
 
     ensureConversation(userId, conversationId, "Analisi documenti");
+
+    sseHeaders(res);
+
     const files = req.files || [];
-    if (!files.length) return res.status(400).json({ error: "Nessun file ricevuto" });
+    if (!files.length) {
+      send({ error: "Nessun file ricevuto.", done: true });
+      return res.end();
+    }
 
-    // SSE headers
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-
-    const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    // Salva un messaggio utente “logico” nello storico, così la chat ha contesto
+    saveMsg(userId, conversationId, "user",
+      `Ho caricato ${files.length} documento/i PDF per l’analisi ACTA SCAN. Procedi con esame e report.`
+    );
 
     send({ progress: 5, stage: "Estrazione testo dai PDF…" });
 
-    // 1) Parse PDFs
     const docs = [];
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       if (f.mimetype !== "application/pdf") {
-        send({ progress: 0, stage: "Formato non supportato (solo PDF).", done: true });
+        send({ error: "Formato non supportato (solo PDF).", done: true });
         return res.end();
       }
       const parsed = await pdfParse(f.buffer);
       const text = (parsed.text || "").trim();
       docs.push({ name: f.originalname, text });
-      send({ progress: 10 + Math.round((i / Math.max(1, files.length)) * 10), stage: `Testo estratto: ${f.originalname}` });
+
+      const p = 10 + Math.round((i / Math.max(1, files.length)) * 10);
+      send({ progress: p, stage: `Testo estratto: ${f.originalname}` });
     }
 
-    // 2) Analyze each doc with chunking
     const perDocReports = [];
+
     for (let d = 0; d < docs.length; d++) {
       const doc = docs[d];
+
       if (!doc.text) {
-        perDocReports.push(`## REPORT DOCUMENTO: ${doc.name}\n\nImpossibile estrarre testo dal PDF.\n`);
+        perDocReports.push(
+          `## REPORT DOCUMENTO: ${doc.name}\n\n` +
+          `⚠️ Non è stato possibile estrarre testo dal PDF (potrebbe essere una scansione immagine).\n`
+        );
         continue;
       }
 
-      const report = await analyzeDocumentWithChunking(doc.name, doc.text, (p, stage) => {
-        // ripartiamo progress 20..85 per blocchi
-        send({ progress: Math.min(90, Math.max(20, p)), stage });
-      });
-
-      perDocReports.push(`## REPORT DOCUMENTO: ${doc.name}\n\n${report}\n`);
+      const rep = await analyzeDocWithChunking(doc.name, doc.text, (p, stage) => send({ progress: p, stage }));
+      perDocReports.push(`## REPORT DOCUMENTO: ${doc.name}\n\n${rep}\n`);
     }
 
-    // 3) Compare if 2+ docs
     let compareSection = "";
     if (docs.length >= 2) {
       send({ progress: 92, stage: "Comparazione tra documenti…" });
@@ -290,34 +334,35 @@ app.post("/analyze-pdfs-stream", upload.array("files", 5), async (req, res) => {
         temperature: 0.2,
         messages: [
           { role: "system", content: systemCompare() },
-          { role: "user", content:
-            `Confronta i seguenti report (uno per documento). ` +
-            `Dopo aver commentato singolarmente, confrontali tra loro: prevalenza, discordanza, forza relativa, strategie per i prossimi atti.\n\n` +
-            perDocReports.join("\n\n")
-          }
+          { role: "user", content: `Confronta i report seguenti:\n\n${perDocReports.join("\n\n")}` }
         ]
       });
 
-      compareSection = `# CONFRONTO TRA DOCUMENTI\n\n${cmp.choices?.[0]?.message?.content || ""}\n`;
+      compareSection =
+        `# CONFRONTO TRA DOCUMENTI\n\n` +
+        (cmp.choices?.[0]?.message?.content || "") +
+        `\n`;
     }
 
-    const final = `# ANALISI COMPLESSIVA (MULTIFILE + CHUNKING)\n\n` +
+    const final =
+      `# ANALISI COMPLESSIVA (ACTA SCAN)\n\n` +
       perDocReports.join("\n\n") +
-      (compareSection ? `\n\n${compareSection}` : "");
+      `\n\n` +
+      (compareSection || "");
 
-    // Save as assistant message (report)
-    saveMessage(userId, conversationId, "assistant", final);
+    // Salva report nello storico (così la chat lo ricorda)
+    saveMsg(userId, conversationId, "assistant", final);
 
     send({ progress: 100, stage: "Completato ✅ Report salvato.", result: final, done: true });
     res.end();
+
   } catch (e) {
-    console.error(e);
-    try {
-      res.write(`data: ${JSON.stringify({ progress: 0, stage: "Errore server", done: true })}\n\n`);
-      res.end();
-    } catch {}
+    console.error("ANALYZE ERROR:", e);
+    sseHeaders(res);
+    send({ error: prettyErrorMessage(e), done: true });
+    res.end();
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend live on ${PORT}`));
+app.listen(PORT, () => console.log("Live on", PORT));
