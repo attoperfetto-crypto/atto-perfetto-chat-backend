@@ -41,8 +41,22 @@ const MAX_EXTRACTED_TEXT_CHARS = Number(process.env.MAX_EXTRACTED_TEXT_CHARS || 
 // App
 // -------------------------
 const app = express();
-app.use(cors({ origin: true, credentials: true }));
-app.use(helmet({ crossOriginResourcePolicy: false }));
+app.set("trust proxy", 1);
+
+// CORS molto permissivo (ideale in fase di test Builderall)
+app.use(cors({
+  origin: "*",
+  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","X-User-Id"],
+}));
+
+// Rispondi sempre ai preflight
+app.options("*", cors());
+
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  contentSecurityPolicy: false
+}));
 app.use(compression());
 app.use(express.json({ limit: "20mb" }));
 
