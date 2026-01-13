@@ -1,7 +1,6 @@
 {
   "name": "atto-perfetto-chat-backend",
-  "version": "2.0.0",
-  "description": "Atto Perfetto – Chat + PDF analysis: chat libera, fascicoli, upload multi-PDF, chunking, report, ricerca globale",
+  "version": "3.0.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
