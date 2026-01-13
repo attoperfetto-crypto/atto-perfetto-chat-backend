@@ -6,77 +6,71 @@ import multer from "multer";
 import fs from "fs";
 import path from "path";
 import pdfParse from "pdf-parse";
-import { OpenAI } from "openai";
 import Database from "better-sqlite3";
 import { v4 as uuidv4 } from "uuid";
+import { OpenAI } from "openai";
 
-// -------------------------
-// Config (Render-safe paths)
-// -------------------------
+// ---------------------------
+// Config
+// ---------------------------
 const PORT = process.env.PORT || 10000;
-const DATA_DIR = process.env.DATA_DIR || "/opt/render/project/data"; // writable on Render
-const UPLOAD_DIR = `${DATA_DIR}/uploads`;
-const DB_PATH = `${DATA_DIR}/atto_perfetto_chat.sqlite`;
+
+// Render-safe writable folder
+const DATA_DIR = process.env.DATA_DIR || "/opt/render/project/data";
+const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
+const DB_PATH = path.join(DATA_DIR, "app.sqlite");
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// -------------------------
-// OpenAI
-// -------------------------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) console.error("Missing OPENAI_API_KEY in Render → Environment");
-
+if (!OPENAI_API_KEY) {
+  console.error("❌ Missing OPENAI_API_KEY in Render → Environment");
+}
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// default economical model; override in Render env OPENAI_MODEL if needed
+// cost-effective default; you can override in Render env
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-// Safety knobs
-const MAX_HISTORY_MESSAGES = Number(process.env.MAX_HISTORY_MESSAGES || 20); // memory per convo
-const MAX_USER_MESSAGE_CHARS = Number(process.env.MAX_USER_MESSAGE_CHARS || 12000);
-const MAX_EXTRACTED_TEXT_CHARS = Number(process.env.MAX_EXTRACTED_TEXT_CHARS || 700000);
+// memory + limits
+const MAX_HISTORY = Number(process.env.MAX_HISTORY || 18); // last messages
+const MAX_EXTRACTED_CHARS = Number(process.env.MAX_EXTRACTED_CHARS || 600000);
+const CHUNK_CHARS = Number(process.env.CHUNK_CHARS || 6500);
+const FILES_LIMIT = Number(process.env.FILES_LIMIT || 10);
+const FILE_SIZE_LIMIT_MB = Number(process.env.FILE_SIZE_LIMIT_MB || 30);
 
-// -------------------------
+// ---------------------------
 // App
-// -------------------------
+// ---------------------------
 const app = express();
 app.set("trust proxy", 1);
 
-// CORS molto permissivo (ideale in fase di test Builderall)
-app.use(cors({
-  origin: "*",
-  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","X-User-Id"],
-}));
+app.use(compression());
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }));
 
-// Rispondi sempre ai preflight
+// robust CORS for Builderall/Edge/Chrome
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "X-User-Id"],
+  })
+);
 app.options("*", cors());
 
-app.use(helmet({
-  crossOriginResourcePolicy: false,
-  contentSecurityPolicy: false
-}));
-app.use(compression());
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "25mb" }));
 
-// -------------------------
-// DB
-// -------------------------
+// ---------------------------
+// DB (SQLite)
+// ---------------------------
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
 db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
-  title TEXT DEFAULT 'Chat',
-  folder TEXT DEFAULT 'Generale',
+  title TEXT DEFAULT 'Chat Atto Perfetto',
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -85,7 +79,7 @@ CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   conversation_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
-  role TEXT NOT NULL, -- 'user' | 'assistant' | 'system'
+  role TEXT NOT NULL,
   content TEXT NOT NULL,
   created_at TEXT DEFAULT (datetime('now'))
 );
@@ -102,589 +96,373 @@ CREATE TABLE IF NOT EXISTS files (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
-USING fts5(
-  conversation_id,
-  user_id,
-  role,
-  content,
-  content='messages',
-  content_rowid='id'
+CREATE TABLE IF NOT EXISTS reports (
+  conversation_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  report_text TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
 );
-
-CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-  INSERT INTO messages_fts(rowid, conversation_id, user_id, role, content)
-  VALUES (new.id, new.conversation_id, new.user_id, new.role, new.content);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, conversation_id, user_id, role, content)
-  VALUES ('delete', old.id, old.conversation_id, old.user_id, old.role, old.content);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, conversation_id, user_id, role, content)
-  VALUES ('delete', old.id, old.conversation_id, old.user_id, old.role, old.content);
-  INSERT INTO messages_fts(rowid, conversation_id, user_id, role, content)
-  VALUES (new.id, new.conversation_id, new.user_id, new.role, new.content);
-END;
 `);
 
-const stmtEnsureUser = db.prepare(`INSERT OR IGNORE INTO users(id) VALUES (?)`);
-
-const stmtUpsertConversation = db.prepare(`
-  INSERT OR REPLACE INTO conversations(id, user_id, title, folder, created_at, updated_at)
-  VALUES (
-    @id, @user_id, @title, @folder,
-    COALESCE((SELECT created_at FROM conversations WHERE id=@id AND user_id=@user_id), datetime('now')),
-    datetime('now')
-  )
+const qCreateConversation = db.prepare(`
+INSERT OR IGNORE INTO conversations(id, user_id, title) VALUES (?, ?, ?)
+`);
+const qTouchConversation = db.prepare(`
+UPDATE conversations SET updated_at=datetime('now') WHERE id=? AND user_id=?
+`);
+const qGetConversation = db.prepare(`
+SELECT id, title, created_at, updated_at FROM conversations WHERE id=? AND user_id=?
+`);
+const qInsertMessage = db.prepare(`
+INSERT INTO messages(conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)
+`);
+const qGetMessages = db.prepare(`
+SELECT role, content, created_at
+FROM messages
+WHERE conversation_id=? AND user_id=?
+ORDER BY id ASC
+`);
+const qGetLastMessages = db.prepare(`
+SELECT role, content
+FROM messages
+WHERE conversation_id=? AND user_id=?
+ORDER BY id DESC
+LIMIT ?
+`);
+const qInsertFile = db.prepare(`
+INSERT OR REPLACE INTO files(id, conversation_id, user_id, filename, mimetype, size, stored_path, extracted_text)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const qGetFiles = db.prepare(`
+SELECT id, filename, mimetype, size, created_at
+FROM files
+WHERE conversation_id=? AND user_id=?
+ORDER BY datetime(created_at) ASC
+`);
+const qGetFileById = db.prepare(`
+SELECT * FROM files WHERE id=? AND user_id=?
+`);
+const qUpsertReport = db.prepare(`
+INSERT INTO reports(conversation_id, user_id, report_text)
+VALUES (?, ?, ?)
+ON CONFLICT(conversation_id) DO UPDATE SET
+  report_text=excluded.report_text,
+  updated_at=datetime('now')
+`);
+const qGetReport = db.prepare(`
+SELECT report_text, updated_at FROM reports WHERE conversation_id=? AND user_id=?
 `);
 
-const stmtGetConversation = db.prepare(`
-  SELECT id, title, folder, created_at, updated_at
-  FROM conversations
-  WHERE id=? AND user_id=?
-`);
-
-const stmtListConversations = db.prepare(`
-  SELECT id, title, folder, updated_at
-  FROM conversations
-  WHERE user_id=?
-  ORDER BY datetime(updated_at) DESC
-`);
-
-const stmtUpdateConversation = db.prepare(`
-  UPDATE conversations
-  SET title=@title, folder=@folder, updated_at=datetime('now')
-  WHERE id=@id AND user_id=@user_id
-`);
-
-const stmtTouchConversation = db.prepare(`
-  UPDATE conversations SET updated_at=datetime('now')
-  WHERE id=? AND user_id=?
-`);
-
-const stmtInsertMessage = db.prepare(`
-  INSERT INTO messages(conversation_id, user_id, role, content)
-  VALUES (?, ?, ?, ?)
-`);
-
-const stmtGetMessages = db.prepare(`
-  SELECT role, content, created_at
-  FROM messages
-  WHERE conversation_id=? AND user_id=?
-  ORDER BY id ASC
-`);
-
-const stmtGetLastMessages = db.prepare(`
-  SELECT role, content
-  FROM messages
-  WHERE conversation_id=? AND user_id=?
-  ORDER BY id DESC
-  LIMIT ?
-`);
-
-const stmtInsertFile = db.prepare(`
-  INSERT OR REPLACE INTO files(id, conversation_id, user_id, filename, mimetype, size, stored_path, extracted_text)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const stmtGetFilesByConversation = db.prepare(`
-  SELECT id, filename, mimetype, size, created_at
-  FROM files
-  WHERE conversation_id=? AND user_id=?
-  ORDER BY datetime(created_at) ASC
-`);
-
-const stmtGetFileById = db.prepare(`
-  SELECT * FROM files
-  WHERE id=? AND user_id=?
-`);
-
-// -------------------------
-// User middleware
-// -------------------------
-app.use((req, res, next) => {
-  let userId = req.header("x-user-id")?.trim();
-  if (!userId) userId = "u_anon";
-  stmtEnsureUser.run(userId);
-  req.userId = userId;
-  next();
-});
-
-// -------------------------
-// Upload (multer)
-// -------------------------
+// ---------------------------
+// Upload config
+// ---------------------------
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
-    const ts = Date.now();
-    const rnd = Math.random().toString(16).slice(2);
     const ext = path.extname(file.originalname || ".pdf") || ".pdf";
-    cb(null, `${ts}_${rnd}${ext}`);
-  }
+    cb(null, `${Date.now()}_${Math.random().toString(16).slice(2)}${ext}`);
+  },
 });
-
 const upload = multer({
   storage,
-  limits: { fileSize: 30 * 1024 * 1024 } // 30MB each
+  limits: { fileSize: FILE_SIZE_LIMIT_MB * 1024 * 1024 },
 });
 
-// -------------------------
-// SSE helpers
-// -------------------------
-function sseHeaders(res) {
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
-}
-function sseEvent(res, event, data) {
-  res.write(`event: ${event}\n`);
-  const payload = String(data ?? "").replace(/\n/g, "\\n");
-  res.write(`data: ${payload}\n\n`);
+// ---------------------------
+// Helpers
+// ---------------------------
+function getUserId(req) {
+  return (req.header("x-user-id") || "u_anon").trim();
 }
 
-// -------------------------
-// System prompt (senior)
-// -------------------------
 function systemPromptSenior() {
   return `
-Sei “Atto Perfetto – Avvocato Senior” (Italia, diritto civile). 
-Agisci come un legale esperto: impostazione rigorosa, concreta, orientata a strategia e redazione.
+Sei “Atto Perfetto – Avvocato Senior” (Italia, diritto civile).
+Obiettivo: aiutare l’Avvocato a comprendere e impostare strategia e redazione atti in modo rigoroso, pratico e operativo.
 
 Regole:
 - Tono professionale, tecnico ma chiaro.
-- Non inventare dati/fatti: se manca qualcosa, indica cosa manca e perché è importante.
-- Evidenzia: struttura, domanda, eccezioni, onere probatorio, criticità, contraddizioni e linee difensive/offensive.
-- Se l’utente chiede un atto, proponi una scaletta e poi una bozza pulita, con sezioni e stile forense.
-- Se l’utente chiede analisi, produci un’analisi ordinata per punti e suggerisci come rafforzare.
-
-Se sono presenti documenti caricati, puoi usarli come base ma senza trascrivere integralmente testi lunghi.
-  `.trim();
+- Non inventare fatti: se mancano dati, indica quali e perché sono rilevanti.
+- Priorità: coerenza logico-giuridica, onere della prova, eccezioni, rischi, alternative.
+- Quando richiesto un atto: proponi prima scaletta, poi bozza completa con sezioni forensi.
+- Se ci sono documenti caricati e/o report, usarli come base senza trascrivere integralmente testi lunghi.
+`.trim();
 }
 
-// -------------------------
-// Chunking
-// -------------------------
-function chunkText(text, maxChars = 6500) {
-  const clean = (text || "").replace(/\r/g, "").trim();
-  if (!clean) return [];
-  const chunks = [];
-  let i = 0;
-  while (i < clean.length) {
-    chunks.push(clean.slice(i, i + maxChars));
-    i += maxChars;
-  }
-  return chunks;
+function chunkText(text, size = CHUNK_CHARS) {
+  const t = (text || "").replace(/\r/g, "").trim();
+  const out = [];
+  for (let i = 0; i < t.length; i += size) out.push(t.slice(i, i + size));
+  return out;
 }
 
-// -------------------------
+function sanitizeExtracted(text) {
+  let t = (text || "").trim();
+  if (t.length > MAX_EXTRACTED_CHARS) t = t.slice(0, MAX_EXTRACTED_CHARS);
+  return t;
+}
+
+async function callLLM(messages, temperature = 0.2) {
+  const r = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature,
+    messages,
+  });
+  return r?.choices?.[0]?.message?.content?.trim() || "";
+}
+
+// ---------------------------
 // Routes
-// -------------------------
+// ---------------------------
 app.get("/health", (req, res) => {
   res.json({ ok: true, model: OPENAI_MODEL, time: new Date().toISOString() });
 });
 
-// Create conversation
+// Create/ensure conversation
 app.post("/api/conversations", (req, res) => {
-  const userId = req.userId;
-  const { id, title, folder } = req.body || {};
-  if (!id) return res.status(400).json({ error: "Missing id" });
-
-  stmtUpsertConversation.run({
-    id,
-    user_id: userId,
-    title: title || "Chat Atto Perfetto",
-    folder: folder || "Generale"
-  });
-
-  // First system msg (optional)
-  stmtInsertMessage.run(id, userId, "system", "Sessione avviata.");
-  stmtTouchConversation.run(id, userId);
-
-  res.json({ ok: true, id });
-});
-
-// List conversations
-app.get("/api/conversations", (req, res) => {
-  const userId = req.userId;
-  res.json(stmtListConversations.all(userId));
-});
-
-// Get conversation detail
-app.get("/api/conversations/:id", (req, res) => {
-  const userId = req.userId;
-  const id = req.params.id;
-
-  const conv = stmtGetConversation.get(id, userId);
-  if (!conv) return res.status(404).json({ error: "Conversation not found" });
-
-  const messages = stmtGetMessages.all(id, userId);
-  const files = stmtGetFilesByConversation.all(id, userId);
-
-  res.json({ conversation: conv, messages, files });
-});
-
-// Update conversation (title/folder)
-app.put("/api/conversations/:id", (req, res) => {
-  const userId = req.userId;
-  const id = req.params.id;
-  const { title, folder } = req.body || {};
-
-  const conv = stmtGetConversation.get(id, userId);
-  if (!conv) return res.status(404).json({ error: "Conversation not found" });
-
-  stmtUpdateConversation.run({
-    id,
-    user_id: userId,
-    title: title || conv.title,
-    folder: folder || conv.folder
-  });
-
-  res.json({ ok: true });
-});
-
-// Global search (FTS)
-app.get("/api/search", (req, res) => {
-  const userId = req.userId;
-  const q = (req.query.q || "").toString().trim();
-  if (!q) return res.json([]);
-
-  const safe = q.replace(/"/g, '""');
-  const sql = `
-    SELECT conversation_id,
-           snippet(messages_fts, 3, '⟦', '⟧', '…', 14) AS snippet
-    FROM messages_fts
-    WHERE messages_fts MATCH ?
-      AND user_id = ?
-    ORDER BY rank
-    LIMIT 50
-  `;
-
-  try {
-    const stmt = db.prepare(sql);
-    const rows = stmt.all(`"${safe}"`, userId);
-    res.json(rows);
-  } catch {
-    try {
-      const stmt = db.prepare(sql);
-      const rows = stmt.all(safe, userId);
-      res.json(rows);
-    } catch {
-      res.status(500).json({ error: "Search error" });
-    }
-  }
-});
-
-// Upload multi PDFs
-app.post("/api/upload", upload.array("files", 10), async (req, res) => {
-  const userId = req.userId;
-  const conversationId = req.body.conversationId;
-
+  const userId = getUserId(req);
+  const { conversationId, title } = req.body || {};
   if (!conversationId) return res.status(400).json({ error: "Missing conversationId" });
 
-  // ensure conversation exists
-  const existing = stmtGetConversation.get(conversationId, userId);
-  if (!existing) {
-    stmtUpsertConversation.run({
-      id: conversationId,
-      user_id: userId,
-      title: "Chat Atto Perfetto",
-      folder: "Generale"
-    });
-  }
+  qCreateConversation.run(conversationId, userId, title || "Chat Atto Perfetto");
+  qInsertMessage.run(conversationId, userId, "system", "Sessione avviata.");
+  qTouchConversation.run(conversationId, userId);
+
+  res.json({ ok: true, conversationId });
+});
+
+// Load conversation (messages + files + report)
+app.get("/api/conversations/:id", (req, res) => {
+  const userId = getUserId(req);
+  const id = req.params.id;
+
+  const conv = qGetConversation.get(id, userId);
+  if (!conv) return res.status(404).json({ error: "Conversation not found" });
+
+  const messages = qGetMessages.all(id, userId);
+  const files = qGetFiles.all(id, userId);
+  const rep = qGetReport.get(id, userId);
+
+  res.json({ conversation: conv, messages, files, report: rep?.report_text || "" });
+});
+
+// Upload multi PDF
+app.post("/api/upload", upload.array("files", FILES_LIMIT), async (req, res) => {
+  const userId = getUserId(req);
+  const { conversationId } = req.body || {};
+  if (!conversationId) return res.status(400).json({ error: "Missing conversationId" });
+
+  qCreateConversation.run(conversationId, userId, "Chat Atto Perfetto");
 
   const files = req.files || [];
   if (!files.length) return res.status(400).json({ error: "No files uploaded" });
 
-  const out = [];
+  const saved = [];
   for (const f of files) {
     const fileId = "f_" + uuidv4();
-
     let extracted = "";
     try {
       const buf = fs.readFileSync(f.path);
       const parsed = await pdfParse(buf);
-      extracted = (parsed?.text || "").trim();
-      if (extracted.length > MAX_EXTRACTED_TEXT_CHARS) {
-        extracted = extracted.slice(0, MAX_EXTRACTED_TEXT_CHARS);
-      }
+      extracted = sanitizeExtracted(parsed?.text || "");
     } catch {
       extracted = "";
     }
-
-    stmtInsertFile.run(
-      fileId,
-      conversationId,
-      userId,
-      f.originalname,
-      f.mimetype,
-      f.size,
-      f.path,
-      extracted
-    );
-
-    out.push({ id: fileId, name: f.originalname, size: f.size });
+    qInsertFile.run(fileId, conversationId, userId, f.originalname, f.mimetype, f.size, f.path, extracted);
+    saved.push({ id: fileId, filename: f.originalname, size: f.size });
   }
 
-  stmtTouchConversation.run(conversationId, userId);
-  stmtInsertMessage.run(
+  qInsertMessage.run(
     conversationId,
     userId,
     "user",
-    `Caricati ${out.length} PDF: ${out.map(x => x.name).join(" • ")}`
+    `Caricati ${saved.length} documenti: ${saved.map(s => s.filename).join(" • ")}`
   );
-  stmtTouchConversation.run(conversationId, userId);
+  qTouchConversation.run(conversationId, userId);
 
-  res.json({ ok: true, files: out });
+  res.json({ ok: true, files: saved });
 });
 
-// -------------------------
-// CHAT LIBERA (SSE streaming)
-// -------------------------
-app.post("/api/chat/stream", async (req, res) => {
-  const userId = req.userId;
-  const { conversationId, message } = req.body || {};
-
-  if (!conversationId) return res.status(400).json({ error: "Missing conversationId" });
-  if (!message || !String(message).trim()) return res.status(400).json({ error: "Missing message" });
-  if (!OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY missing on server" });
-
-  const msg = String(message).slice(0, MAX_USER_MESSAGE_CHARS);
-
-  // ensure conversation exists
-  const conv = stmtGetConversation.get(conversationId, userId);
-  if (!conv) {
-    stmtUpsertConversation.run({
-      id: conversationId,
-      user_id: userId,
-      title: "Chat Atto Perfetto",
-      folder: "Generale"
-    });
-    stmtInsertMessage.run(conversationId, userId, "system", "Sessione avviata.");
-  }
-
-  // save user msg
-  stmtInsertMessage.run(conversationId, userId, "user", msg);
-  stmtTouchConversation.run(conversationId, userId);
-
-  // build memory (last N)
-  const last = stmtGetLastMessages.all(conversationId, userId, MAX_HISTORY_MESSAGES).reverse();
-
-  const messages = [
-    { role: "system", content: systemPromptSenior() },
-    ...last.map(m => ({ role: m.role === "system" ? "system" : m.role, content: m.content }))
-  ];
-
-  // SSE stream
-  sseHeaders(res);
-  sseEvent(res, "meta", JSON.stringify({ model: OPENAI_MODEL }));
-
-  try {
-    const stream = await openai.chat.completions.create({
-      model: OPENAI_MODEL,
-      temperature: 0.25,
-      stream: true,
-      messages
-    });
-
-    let full = "";
-    for await (const part of stream) {
-      const delta = part?.choices?.[0]?.delta?.content || "";
-      if (delta) {
-        full += delta;
-        sseEvent(res, "delta", delta);
-      }
-    }
-
-    const finalText = full.trim() || "—";
-    stmtInsertMessage.run(conversationId, userId, "assistant", finalText);
-    stmtTouchConversation.run(conversationId, userId);
-
-    sseEvent(res, "done", "");
-    res.end();
-  } catch (e) {
-    sseEvent(res, "error", e?.message || "Errore chat");
-    sseEvent(res, "done", "");
-    res.end();
-  }
-});
-
-// -------------------------
-// PDF ANALYZE -> REPORT (SSE)
-// -------------------------
-app.post("/api/analyze/stream", async (req, res) => {
-  const userId = req.userId;
+// Analyze & compare PDFs -> save report
+app.post("/api/analyze", async (req, res) => {
+  const userId = getUserId(req);
   const { conversationId, fileIds } = req.body || {};
-
   if (!conversationId) return res.status(400).json({ error: "Missing conversationId" });
-  if (!Array.isArray(fileIds) || fileIds.length === 0) {
-    return res.status(400).json({ error: "Missing fileIds" });
-  }
+  if (!Array.isArray(fileIds) || !fileIds.length) return res.status(400).json({ error: "Missing fileIds" });
   if (!OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY missing on server" });
 
-  // ensure conversation exists
-  const conv = stmtGetConversation.get(conversationId, userId);
-  if (!conv) {
-    stmtUpsertConversation.run({
-      id: conversationId,
-      user_id: userId,
-      title: "Chat Atto Perfetto",
-      folder: "Generale"
-    });
-    stmtInsertMessage.run(conversationId, userId, "system", "Sessione avviata.");
-  }
-
-  sseHeaders(res);
-  sseEvent(res, "meta", JSON.stringify({ model: OPENAI_MODEL, files: fileIds.length }));
-
-  // Load files
   const fileRows = [];
   for (const id of fileIds) {
-    const row = stmtGetFileById.get(id, userId);
+    const row = qGetFileById.get(id, userId);
     if (row) fileRows.push(row);
   }
-  if (!fileRows.length) {
-    sseEvent(res, "error", "Nessun file valido trovato.");
-    sseEvent(res, "done", "");
-    return res.end();
-  }
+  if (!fileRows.length) return res.status(400).json({ error: "No valid files found" });
 
-  const perDocReports = [];
-  let globalReportText = "";
+  // 1) per-doc notes via chunking
+  const perDoc = [];
+  for (const f of fileRows) {
+    const text = (f.extracted_text || "").trim();
+    if (!text) {
+      perDoc.push({ filename: f.filename, notes: `⚠️ Testo non estratto (PDF scannerizzato o immagine).` });
+      continue;
+    }
 
-  try {
-    for (let idx = 0; idx < fileRows.length; idx++) {
-      const f = fileRows[idx];
-      const text = (f.extracted_text || "").trim();
-      sseEvent(res, "status", `Documento ${idx + 1}/${fileRows.length}: ${f.filename}`);
-
-      if (!text) {
-        const warn = `⚠️ "${f.filename}": testo non estratto (PDF scannerizzato/immagine).`;
-        const docRep = `# REPORT DOCUMENTO: ${f.filename}\n\n${warn}\n`;
-        perDocReports.push({ filename: f.filename, report: docRep });
-        globalReportText += `\n\n${docRep}`;
-        sseEvent(res, "delta", `\n\n${docRep}\n`);
-        continue;
-      }
-
-      const chunks = chunkText(text, 6500);
-      const partial = [];
-
-      for (let c = 0; c < chunks.length; c++) {
-        sseEvent(res, "progress", JSON.stringify({ file: f.filename, chunk: c + 1, totalChunks: chunks.length }));
-
-        const chunkPrompt = `
-Analizza questo estratto di atto/documento (diritto civile italiano).
-
-Produci note tecniche (max 20 righe) su:
+    const chunks = chunkText(text, CHUNK_CHARS);
+    const partialNotes = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const prompt = `
+Analizza questo estratto di documento/atto civile.
+Produci NOTE TECNICHE (max 20 righe) su:
 - punti di forza
-- debolezze/contraddizioni/omissioni
-- istituti e fattispecie (forte/debole)
+- punti deboli/contraddizioni/omissioni
+- istituti/fattispecie (forte/debole)
 - profilo probatorio (cosa manca)
 - suggerimenti operativi
 
 TESTO:
-${chunks[c]}
-        `.trim();
+${chunks[i]}
+`.trim();
 
-        const r = await openai.chat.completions.create({
-          model: OPENAI_MODEL,
-          temperature: 0.2,
-          messages: [
-            { role: "system", content: systemPromptSenior() },
-            { role: "user", content: chunkPrompt }
-          ]
-        });
+      const out = await callLLM(
+        [
+          { role: "system", content: systemPromptSenior() },
+          { role: "user", content: prompt },
+        ],
+        0.2
+      );
+      partialNotes.push(out);
+    }
 
-        partial.push(r?.choices?.[0]?.message?.content?.trim() || "");
-      }
+    // consolidate
+    const consPrompt = `
+Consolida le NOTE PARZIALI in un report unico per "${f.filename}".
+Struttura OBBLIGATORIA:
 
-      const consolidatePrompt = `
-Consolida le note parziali in un report unico e completo per "${f.filename}".
-Usa questa struttura OBBLIGATORIA:
-
-# REPORT DOCUMENTO: ${f.filename}
-
-## 1) Sintesi fedele (max 12 righe)
-## 2) Punti di forza
-## 3) Debolezze / Contraddizioni / Omissioni (con suggerimenti operativi)
-## 4) Istituti e fattispecie (forte/debole + pertinenza)
-## 5) Prove e onere probatorio (cosa c’è / cosa manca)
-## 6) Strategie operative (prossimi atti possibili)
+## Documento: ${f.filename}
+1) Sintesi fedele (max 10 righe)
+2) Punti forti (con motivazione)
+3) Punti deboli / contraddizioni / omissioni (con suggerimenti)
+4) Istituti e fattispecie (forte/debole + pertinenza)
+5) Prove e onere probatorio (cosa c’è / cosa manca)
+6) Prossimi passi (atti/strategie)
 
 NOTE PARZIALI:
-${partial.join("\n\n---\n\n")}
-      `.trim();
+${partialNotes.join("\n\n---\n\n")}
+`.trim();
 
-      const r2 = await openai.chat.completions.create({
-        model: OPENAI_MODEL,
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: systemPromptSenior() },
-          { role: "user", content: consolidatePrompt }
-        ]
-      });
+    const notes = await callLLM(
+      [
+        { role: "system", content: systemPromptSenior() },
+        { role: "user", content: consPrompt },
+      ],
+      0.2
+    );
 
-      const docReport = r2?.choices?.[0]?.message?.content?.trim() || "";
-      perDocReports.push({ filename: f.filename, report: docReport });
-      globalReportText += `\n\n${docReport}`;
+    perDoc.push({ filename: f.filename, notes });
+  }
 
-      sseEvent(res, "delta", `\n\n${docReport}\n`);
-      sseEvent(res, "separator", "\n\n---\n\n");
-    }
+  // 2) compare all docs
+  let compareSection = "";
+  if (perDoc.length > 1) {
+    const cmpPrompt = `
+Hai più documenti relativi a una controversia civile.
 
-    if (perDocReports.length > 1) {
-      sseEvent(res, "status", "Confronto complessivo tra documenti…");
+Crea una sezione:
+# Confronto complessivo e indicazioni strategiche
 
-      const comparePrompt = `
-Sono stati analizzati più documenti relativi ad una controversia civile.
+1) Dove le argomentazioni divergono
+2) Quali tesi risultano più forti e perché (diritto + prova)
+3) Vulnerabilità reciproche
+4) Suggerimenti operativi per entrambe le parti (attore e convenuto)
+5) Spunti transattivi/gestione rischio (se opportuno)
 
-Genera una sezione finale con:
-# CONFRONTO COMPLESSIVO E INDICAZIONI STRATEGICHE
+DOCUMENTI (sintesi):
+${perDoc.map(d => `- ${d.filename}\n${d.notes}`).join("\n\n")}
+`.trim();
 
-1) Confronto tra tesi e argomentazioni (coerenza, diritto, prova)
-2) Dove uno tende a prevalere sull’altro e perché
-3) Punti discordanti e vulnerabilità reciproche
-4) Suggerimenti per ENTRAMBE le parti (attore e convenuto) sui prossimi atti
-5) Spunti per gestione del rischio / transazione (se sensato)
+    compareSection = await callLLM(
+      [
+        { role: "system", content: systemPromptSenior() },
+        { role: "user", content: cmpPrompt },
+      ],
+      0.2
+    );
+  }
 
-REPORT DOCUMENTI:
-${perDocReports.map(d => `DOCUMENTO: ${d.filename}\n${d.report}`).join("\n\n=====\n\n")}
-      `.trim();
+  const finalReport = `
+# Report Atto Perfetto – Esame/Analisi Documenti
 
-      const r3 = await openai.chat.completions.create({
-        model: OPENAI_MODEL,
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: systemPromptSenior() },
-          { role: "user", content: comparePrompt }
-        ]
-      });
+${perDoc.map(d => d.notes.startsWith("## Documento:") ? d.notes : `## Documento: ${d.filename}\n${d.notes}`).join("\n\n")}
 
-      const compareOut = r3?.choices?.[0]?.message?.content?.trim() || "";
-      globalReportText += `\n\n${compareOut}`;
-      sseEvent(res, "delta", `\n\n${compareOut}\n`);
-    }
+${compareSection ? `\n\n${compareSection}\n` : ""}
+`.trim();
 
-    // Save report as assistant msg (so searchable globally)
-    stmtInsertMessage.run(conversationId, userId, "assistant", globalReportText.trim() || "Report generato.");
-    stmtTouchConversation.run(conversationId, userId);
+  qUpsertReport.run(conversationId, userId, finalReport);
+  qInsertMessage.run(conversationId, userId, "assistant", finalReport);
+  qTouchConversation.run(conversationId, userId);
 
-    sseEvent(res, "done", "");
-    return res.end();
+  res.json({ ok: true, report: finalReport });
+});
+
+// Chat (continua conversazione tenendo conto di report + documenti)
+app.post("/api/chat", async (req, res) => {
+  const userId = getUserId(req);
+  const { conversationId, message } = req.body || {};
+  if (!conversationId) return res.status(400).json({ error: "Missing conversationId" });
+  if (!message || !String(message).trim()) return res.status(400).json({ error: "Missing message" });
+  if (!OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY missing on server" });
+
+  qCreateConversation.run(conversationId, userId, "Chat Atto Perfetto");
+
+  const userMsg = String(message).trim();
+  qInsertMessage.run(conversationId, userId, "user", userMsg);
+  qTouchConversation.run(conversationId, userId);
+
+  // get report + files (document context)
+  const rep = qGetReport.get(conversationId, userId);
+  const reportText = rep?.report_text || "";
+
+  const files = qGetFiles.all(conversationId, userId);
+  const filesContext = files
+    .map(f => `- ${f.filename} (${Math.round((f.size || 0)/1024)} KB)`)
+    .join("\n");
+
+  // last chat messages for memory
+  const last = qGetLastMessages.all(conversationId, userId, MAX_HISTORY).reverse();
+
+  const contextBlock = `
+Contesto documentale disponibile:
+${filesContext || "- (nessun file)"}
+
+Report (se presente):
+${reportText ? reportText.slice(0, 14000) : "(nessun report ancora generato)"}
+
+Istruzione: usa questo contesto per rispondere e, se richiesto, redigere un atto coerente con documenti e report.
+`.trim();
+
+  const messages = [
+    { role: "system", content: systemPromptSenior() },
+    { role: "system", content: contextBlock },
+    ...last.map(m => ({
+      role: (m.role === "assistant" || m.role === "user" || m.role === "system") ? m.role : "user",
+      content: m.content
+    }))
+  ];
+
+  try {
+    const out = await callLLM(messages, 0.25);
+    qInsertMessage.run(conversationId, userId, "assistant", out || "—");
+    qTouchConversation.run(conversationId, userId);
+    res.json({ ok: true, reply: out });
   } catch (e) {
-    sseEvent(res, "error", e?.message || "Errore durante l’analisi");
-    sseEvent(res, "done", "");
-    return res.end();
+    res.status(500).json({ error: e?.message || "Chat error" });
   }
 });
 
-// -------------------------
-// Start
-// -------------------------
+// ---------------------------
 app.listen(PORT, () => {
-  console.log(`✅ Atto Perfetto Chat backend on port ${PORT}`);
+  console.log(`✅ Backend live on port ${PORT}`);
   console.log(`MODEL: ${OPENAI_MODEL}`);
   console.log(`DATA_DIR: ${DATA_DIR}`);
 });
