@@ -1,16 +1,25 @@
 {
   "name": "atto-perfetto-chat-backend",
   "version": "1.0.0",
+  "description": "Atto Perfetto backend: chat SSE, upload PDF, chunking, fascicoli, ricerca globale (SQLite FTS)",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18.18.0"
+  },
   "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "compression": "^1.7.4",
+    "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "helmet": "^7.1.0",
     "multer": "^1.4.5-lts.1",
-    "openai": "^4.56.0",
-    "pdf-parse": "^1.1.1"
+    "openai": "^4.70.0",
+    "pdf-parse": "^1.1.1",
+    "uuid": "^9.0.1"
   }
 }
