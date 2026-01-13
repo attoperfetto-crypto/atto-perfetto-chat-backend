@@ -24,16 +24,13 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error("❌ Missing OPENAI_API_KEY in Render → Environment");
-}
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+if (!OPENAI_API_KEY) console.error("❌ Missing OPENAI_API_KEY in Render → Environment");
 
-// cost-effective default; you can override in Render env
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
 // memory + limits
-const MAX_HISTORY = Number(process.env.MAX_HISTORY || 18); // last messages
+const MAX_HISTORY = Number(process.env.MAX_HISTORY || 18);
 const MAX_EXTRACTED_CHARS = Number(process.env.MAX_EXTRACTED_CHARS || 600000);
 const CHUNK_CHARS = Number(process.env.CHUNK_CHARS || 6500);
 const FILES_LIMIT = Number(process.env.FILES_LIMIT || 10);
@@ -48,7 +45,6 @@ app.set("trust proxy", 1);
 app.use(compression());
 app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }));
 
-// robust CORS for Builderall/Edge/Chrome
 app.use(
   cors({
     origin: "*",
@@ -67,10 +63,18 @@ const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
 db.exec(`
+CREATE TABLE IF NOT EXISTS folders (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
   title TEXT DEFAULT 'Chat Atto Perfetto',
+  folder_id TEXT DEFAULT NULL,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -105,44 +109,50 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 `);
 
-const qCreateConversation = db.prepare(`
-INSERT OR IGNORE INTO conversations(id, user_id, title) VALUES (?, ?, ?)
-`);
-const qTouchConversation = db.prepare(`
-UPDATE conversations SET updated_at=datetime('now') WHERE id=? AND user_id=?
-`);
-const qGetConversation = db.prepare(`
-SELECT id, title, created_at, updated_at FROM conversations WHERE id=? AND user_id=?
-`);
-const qInsertMessage = db.prepare(`
-INSERT INTO messages(conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)
-`);
+// ---------------------------
+// Queries
+// ---------------------------
+// folders
+const qCreateFolder = db.prepare(`INSERT INTO folders(id, user_id, name) VALUES (?, ?, ?)`);
+const qListFolders = db.prepare(`SELECT id, name, created_at FROM folders WHERE user_id=? ORDER BY datetime(created_at) DESC`);
+const qGetFolder = db.prepare(`SELECT id, name FROM folders WHERE id=? AND user_id=?`);
+
+// conversations
+const qCreateConversation = db.prepare(`INSERT OR IGNORE INTO conversations(id, user_id, title) VALUES (?, ?, ?)`);
+const qTouchConversation = db.prepare(`UPDATE conversations SET updated_at=datetime('now') WHERE id=? AND user_id=?`);
+const qGetConversation = db.prepare(`SELECT id, title, folder_id, created_at, updated_at FROM conversations WHERE id=? AND user_id=?`);
+const qSetConversationFolder = db.prepare(`UPDATE conversations SET folder_id=?, updated_at=datetime('now') WHERE id=? AND user_id=?`);
+
+// messages
+const qInsertMessage = db.prepare(`INSERT INTO messages(conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)`);
 const qGetMessages = db.prepare(`
-SELECT role, content, created_at
-FROM messages
-WHERE conversation_id=? AND user_id=?
-ORDER BY id ASC
+  SELECT role, content, created_at
+  FROM messages
+  WHERE conversation_id=? AND user_id=?
+  ORDER BY id ASC
 `);
 const qGetLastMessages = db.prepare(`
-SELECT role, content
-FROM messages
-WHERE conversation_id=? AND user_id=?
-ORDER BY id DESC
-LIMIT ?
+  SELECT role, content
+  FROM messages
+  WHERE conversation_id=? AND user_id=?
+  ORDER BY id DESC
+  LIMIT ?
 `);
+
+// files
 const qInsertFile = db.prepare(`
 INSERT OR REPLACE INTO files(id, conversation_id, user_id, filename, mimetype, size, stored_path, extracted_text)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const qGetFiles = db.prepare(`
-SELECT id, filename, mimetype, size, created_at
-FROM files
-WHERE conversation_id=? AND user_id=?
-ORDER BY datetime(created_at) ASC
+  SELECT id, filename, mimetype, size, created_at
+  FROM files
+  WHERE conversation_id=? AND user_id=?
+  ORDER BY datetime(created_at) ASC
 `);
-const qGetFileById = db.prepare(`
-SELECT * FROM files WHERE id=? AND user_id=?
-`);
+const qGetFileById = db.prepare(`SELECT * FROM files WHERE id=? AND user_id=?`);
+
+// report
 const qUpsertReport = db.prepare(`
 INSERT INTO reports(conversation_id, user_id, report_text)
 VALUES (?, ?, ?)
@@ -150,9 +160,7 @@ ON CONFLICT(conversation_id) DO UPDATE SET
   report_text=excluded.report_text,
   updated_at=datetime('now')
 `);
-const qGetReport = db.prepare(`
-SELECT report_text, updated_at FROM reports WHERE conversation_id=? AND user_id=?
-`);
+const qGetReport = db.prepare(`SELECT report_text, updated_at FROM reports WHERE conversation_id=? AND user_id=?`);
 
 // ---------------------------
 // Upload config
@@ -179,14 +187,14 @@ function getUserId(req) {
 function systemPromptSenior() {
   return `
 Sei “Atto Perfetto – Avvocato Senior” (Italia, diritto civile).
-Obiettivo: aiutare l’Avvocato a comprendere e impostare strategia e redazione atti in modo rigoroso, pratico e operativo.
+Obiettivo: supportare l’Avvocato nella comprensione, strategia e redazione atti con rigore e operatività.
 
 Regole:
 - Tono professionale, tecnico ma chiaro.
-- Non inventare fatti: se mancano dati, indica quali e perché sono rilevanti.
+- Non inventare fatti: se mancano dati, chiedi SOLO quelli essenziali.
 - Priorità: coerenza logico-giuridica, onere della prova, eccezioni, rischi, alternative.
-- Quando richiesto un atto: proponi prima scaletta, poi bozza completa con sezioni forensi.
-- Se ci sono documenti caricati e/o report, usarli come base senza trascrivere integralmente testi lunghi.
+- Quando richiesto un atto: proponi prima scaletta, poi bozza completa.
+- Se ci sono documenti/report, usali come base senza copiare testi lunghi.
 `.trim();
 }
 
@@ -219,20 +227,64 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, model: OPENAI_MODEL, time: new Date().toISOString() });
 });
 
-// Create/ensure conversation
+// ---------------------------
+// Folders (Fascicoli)
+// ---------------------------
+app.get("/api/folders", (req, res) => {
+  const userId = getUserId(req);
+  const folders = qListFolders.all(userId);
+  res.json({ ok: true, folders });
+});
+
+app.post("/api/folders", (req, res) => {
+  const userId = getUserId(req);
+  const { name } = req.body || {};
+  if (!name || !String(name).trim()) return res.status(400).json({ error: "Missing name" });
+
+  const folderId = "fd_" + uuidv4();
+  const folderName = String(name).trim();
+
+  qCreateFolder.run(folderId, userId, folderName);
+  res.json({ ok: true, folder: { id: folderId, name: folderName } });
+});
+
+// ---------------------------
+// Conversations
+// ---------------------------
 app.post("/api/conversations", (req, res) => {
   const userId = getUserId(req);
   const { conversationId, title } = req.body || {};
   if (!conversationId) return res.status(400).json({ error: "Missing conversationId" });
 
   qCreateConversation.run(conversationId, userId, title || "Chat Atto Perfetto");
-  qInsertMessage.run(conversationId, userId, "system", "Sessione avviata.");
-  qTouchConversation.run(conversationId, userId);
 
+  // Inseriamo un "system" solo se la chat è nuova e vuota (evitiamo duplicati)
+  const existing = qGetMessages.all(conversationId, userId);
+  if (!existing || existing.length === 0) {
+    qInsertMessage.run(conversationId, userId, "system", "Sessione avviata.");
+  }
+
+  qTouchConversation.run(conversationId, userId);
   res.json({ ok: true, conversationId });
 });
 
-// Load conversation (messages + files + report)
+app.post("/api/conversations/:id/folder", (req, res) => {
+  const userId = getUserId(req);
+  const conversationId = req.params.id;
+  const { folderId } = req.body || {};
+
+  const conv = qGetConversation.get(conversationId, userId);
+  if (!conv) return res.status(404).json({ error: "Conversation not found" });
+
+  if (folderId) {
+    const f = qGetFolder.get(folderId, userId);
+    if (!f) return res.status(400).json({ error: "Folder not found" });
+  }
+
+  qSetConversationFolder.run(folderId || null, conversationId, userId);
+  res.json({ ok: true });
+});
+
 app.get("/api/conversations/:id", (req, res) => {
   const userId = getUserId(req);
   const id = req.params.id;
@@ -244,10 +296,18 @@ app.get("/api/conversations/:id", (req, res) => {
   const files = qGetFiles.all(id, userId);
   const rep = qGetReport.get(id, userId);
 
-  res.json({ conversation: conv, messages, files, report: rep?.report_text || "" });
+  res.json({
+    conversation: { id: conv.id, title: conv.title, created_at: conv.created_at, updated_at: conv.updated_at },
+    folderId: conv.folder_id || null,
+    messages,
+    files,
+    report: rep?.report_text || ""
+  });
 });
 
+// ---------------------------
 // Upload multi PDF
+// ---------------------------
 app.post("/api/upload", upload.array("files", FILES_LIMIT), async (req, res) => {
   const userId = getUserId(req);
   const { conversationId } = req.body || {};
@@ -284,7 +344,9 @@ app.post("/api/upload", upload.array("files", FILES_LIMIT), async (req, res) => 
   res.json({ ok: true, files: saved });
 });
 
+// ---------------------------
 // Analyze & compare PDFs -> save report
+// ---------------------------
 app.post("/api/analyze", async (req, res) => {
   const userId = getUserId(req);
   const { conversationId, fileIds } = req.body || {};
@@ -299,17 +361,17 @@ app.post("/api/analyze", async (req, res) => {
   }
   if (!fileRows.length) return res.status(400).json({ error: "No valid files found" });
 
-  // 1) per-doc notes via chunking
   const perDoc = [];
   for (const f of fileRows) {
     const text = (f.extracted_text || "").trim();
     if (!text) {
-      perDoc.push({ filename: f.filename, notes: `⚠️ Testo non estratto (PDF scannerizzato o immagine).` });
+      perDoc.push({ filename: f.filename, notes: `## Documento: ${f.filename}\n⚠️ Testo non estratto (PDF scannerizzato o immagine).` });
       continue;
     }
 
     const chunks = chunkText(text, CHUNK_CHARS);
     const partialNotes = [];
+
     for (let i = 0; i < chunks.length; i++) {
       const prompt = `
 Analizza questo estratto di documento/atto civile.
@@ -334,7 +396,6 @@ ${chunks[i]}
       partialNotes.push(out);
     }
 
-    // consolidate
     const consPrompt = `
 Consolida le NOTE PARZIALI in un report unico per "${f.filename}".
 Struttura OBBLIGATORIA:
@@ -362,7 +423,6 @@ ${partialNotes.join("\n\n---\n\n")}
     perDoc.push({ filename: f.filename, notes });
   }
 
-  // 2) compare all docs
   let compareSection = "";
   if (perDoc.length > 1) {
     const cmpPrompt = `
@@ -393,7 +453,7 @@ ${perDoc.map(d => `- ${d.filename}\n${d.notes}`).join("\n\n")}
   const finalReport = `
 # Report Atto Perfetto – Esame/Analisi Documenti
 
-${perDoc.map(d => d.notes.startsWith("## Documento:") ? d.notes : `## Documento: ${d.filename}\n${d.notes}`).join("\n\n")}
+${perDoc.map(d => d.notes).join("\n\n")}
 
 ${compareSection ? `\n\n${compareSection}\n` : ""}
 `.trim();
@@ -405,7 +465,9 @@ ${compareSection ? `\n\n${compareSection}\n` : ""}
   res.json({ ok: true, report: finalReport });
 });
 
-// Chat (continua conversazione tenendo conto di report + documenti)
+// ---------------------------
+// Chat (continua conversazione tenendo conto di report + files)
+// ---------------------------
 app.post("/api/chat", async (req, res) => {
   const userId = getUserId(req);
   const { conversationId, message } = req.body || {};
@@ -419,16 +481,12 @@ app.post("/api/chat", async (req, res) => {
   qInsertMessage.run(conversationId, userId, "user", userMsg);
   qTouchConversation.run(conversationId, userId);
 
-  // get report + files (document context)
   const rep = qGetReport.get(conversationId, userId);
   const reportText = rep?.report_text || "";
 
   const files = qGetFiles.all(conversationId, userId);
-  const filesContext = files
-    .map(f => `- ${f.filename} (${Math.round((f.size || 0)/1024)} KB)`)
-    .join("\n");
+  const filesContext = files.map(f => `- ${f.filename} (${Math.round((f.size || 0)/1024)} KB)`).join("\n");
 
-  // last chat messages for memory
   const last = qGetLastMessages.all(conversationId, userId, MAX_HISTORY).reverse();
 
   const contextBlock = `
